@@ -61,35 +61,30 @@ x-frontend: &frontend
     - /etc/nginx/conf.d:uid=${PUID},gid=${PGID},mode=700
   restart: always
 
-x-filebeat: &filebeat
-  image: ${REMOTE_DOCKER_REGISTRY}/elastic/filebeat:${ELK_VERSION}
-  user: ${PUID}:${PGID}
-  cpus: ${CPUS_FILEBEAT}
-  mem_limit: ${MEM_LIMIT_FILEBEAT}
-  read_only: true
-  networks:
-    - eurydice
-  restart: always
-  environment:
-    ELASTICSEARCH_API_KEY: ${ELASTICSEARCH_API_KEY}
-    ELASTICSEARCH_HOSTS: ${ELASTICSEARCH_HOSTS}
-  command:
-    - filebeat
-    - run
-    - --strict.perms=false
-    - -e
-  healthcheck:
-    test:
-      - CMD
-      - test
-      - output
-    interval: 10s
-    timeout: 5s
-    retries: 5
-    start_period: 5s
-
 services:
   ############# Common services #############
+  traefik:
+    container_name: traefik
+    image: traefik:3.5
+    profiles:
+      - origin
+    networks:
+      - eurydice
+    command:
+      - "--log.level=DEBUG"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--api.dashboard=true"
+    ports:
+      - "80:80"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    labels:
+      traefik.enable: true
+      traefik.http.routers.dashboard.rule: Host(`traefik.localhost`)
+      traefik.http.routers.dashboard.service: api@internal
+
   db:
     image: ${REMOTE_DOCKER_REGISTRY}/postgres:15
     read_only: true
@@ -151,21 +146,15 @@ services:
     environment:
       NGINX_SERVER_NAME: ${FRONTEND_HOSTNAMES:?}
       NGINX_ROOT_DIR: origin
-
-  filebeat-origin:
-    <<: *filebeat
-    profiles:
-      - origin-with-elk-logging
-    volumes:
-      - "${FILEBEAT_CONFIG_PATH:?}:/usr/share/filebeat/filebeat.yml:ro"
-      - "${FILEBEAT_LOGS_DIR:?}:/usr/share/filebeat/logs"
-      - "${FILEBEAT_DATA_DIR:?}:/usr/share/filebeat/data"
-      - "${ELASTICSEARCH_CERT_PATH:?}:/usr/share/elasticsearch/config/certs/cert.crt:ro"
-      - "${DB_LOGS_DIR:?}:/logs/origin/postgresql:ro"
-      - "${PYTHON_LOGS_DIR:?}/backend-origin:/logs/origin/backend:ro"
-      - "${PYTHON_LOGS_DIR:?}/sender:/logs/origin/sender:ro"
-      - "${PYTHON_LOGS_DIR:?}/dbtrimmer-origin:/logs/origin/dbtrimmer:ro"
-      - "${PYTHON_LOGS_DIR:?}/db-migrations-origin:/logs/origin/db-migrations:ro"
+    labels:
+      traefik.enable: true
+      traefik.http.routers.frontend-origin.rule: Host(`origin.localhost`)
+      traefik.http.routers.frontend-origin.priority: "1"
+      traefik.http.routers.frontend-origin.service: frontend-origin-service
+      traefik.http.services.frontend-origin-service.loadbalancer.server.port: 8080
+        #traefik.http.middlewares.frontend-origin-headers.headers.customrequestheaders.X-Remote-User: guillaume
+        #traefik.http.middlewares.frontend-origin-headers.headers.customrequestheaders.X-Remote-Roles: guillaume
+        #traefik.http.routers.frontend-origin.middlewares: frontend-origin-headers
 
   backend-origin: &backend-origin
     <<: *backend
@@ -185,6 +174,13 @@ services:
       REMOTE_USER_HEADER: ${REMOTE_USER_HEADER}
       METRICS_SLIDING_WINDOW: ${METRICS_SLIDING_WINDOW}
       TRANSFERABLE_MAX_SIZE: ${EURYDICE_TRANSFERABLE_MAX_SIZE}
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.backend-origin.rule: Host(`origin.localhost`) && ( PathPrefix(`/api`) || PathPrefix(`/admin`) || PathPrefix(`/static`) )
+        #traefik.http.middlewares.backend-origin-headers.headers.customrequestheaders.X-Remote-User: guillaume
+        #traefik.http.middlewares.backend-origin-headers.headers.customrequestheaders.X-Remote-Roles: guillaume
+        #traefik.http.routers.backend-origin.middlewares: backend-origin-headers
+
     command:
       - make
       - run-origin-api
@@ -197,14 +193,6 @@ services:
       retries: 5
       start_period: 1s
 
-  backend-origin-with-elk:
-    <<: *backend-origin
-    profiles:
-      - origin-with-elk-logging
-    depends_on:
-      filebeat-origin:
-        condition: service_healthy
-
   dbtrimmer-origin: &dbtrimmer-origin
     <<: *dbtrimmer
     volumes:
@@ -215,13 +203,6 @@ services:
       - make
       - run-origin-dbtrimmer
 
-  dbtrimmer-origin-with-elk:
-    <<: *dbtrimmer-origin
-    profiles:
-      - origin-with-elk-logging
-    depends_on:
-      filebeat-origin:
-        condition: service_healthy
   sender: &sender
     <<: *backend-common
     profiles:
@@ -249,18 +230,6 @@ services:
     command:
       - make
       - run-sender
-
-  sender-with-elk:
-    <<: *sender
-    profiles:
-      - origin-with-elk-logging
-    depends_on:
-      db:
-        condition: service_healthy
-      lidis:
-        condition: service_started
-      filebeat-origin:
-        condition: service_healthy
 
   lidis:
     profiles:
@@ -309,16 +278,30 @@ services:
       db:
         condition: service_healthy
 
-  db-migrations-origin-with-elk:
+  nginx:
+    container_name: nginx
+    image: nginx
     profiles:
-      - migration-origin-with-elk-logging
-    <<: *db-migrations-origin
-    depends_on:
-      db:
-        condition: service_healthy
-      filebeat-origin:
-        condition: service_healthy
+      - origin
+    networks:
+      - eurydice
+    ports:
+      - 9874:80
+    volumes:
+      - ./volumes/default.conf:/etc/nginx/conf.d/default.conf
 
+  whoami:
+    container_name: whoami
+    image: traefik/whoami
+    profiles:
+      - origin
+    labels:
+      traefik.enable: true
+      traefik.http.routers.whoami.rule: Host(`whoami.localhost`)
+      traefik.http.routers.whoami.entrypoints: web
+    networks:
+      - eurydice
+#
   ############# Destination services #############
   lidir: &lidir
     profiles:
@@ -350,14 +333,6 @@ services:
       - "--nb_decoding_threads"
       - "${LIDIR_NB_DECODING_THREADS}"
 
-  lidir-with-elk:
-    <<: *lidir
-    profiles:
-      - destination-with-elk-logging
-    depends_on:
-      receiver-with-elk:
-        condition: service_started
-
   receiver: &receiver
     profiles:
       - destination
@@ -378,14 +353,6 @@ services:
     command:
       - make
       - run-receiver
-
-  receiver-with-elk:
-    profiles:
-      - destination-with-elk-logging
-    <<: *receiver
-    depends_on:
-      filebeat-destination:
-        condition: service_healthy
 
   backend-destination: &backend-destination
     profiles:
@@ -415,14 +382,6 @@ services:
       retries: 5
       start_period: 1s
 
-  backend-destination-with-elk:
-    profiles:
-      - destination-with-elk-logging
-    <<: *backend-destination
-    depends_on:
-      filebeat-destination:
-        condition: service_healthy
-
   frontend-destination:
     <<: *frontend
     profiles:
@@ -431,22 +390,6 @@ services:
     environment:
       NGINX_SERVER_NAME: ${FRONTEND_HOSTNAMES:?}
       NGINX_ROOT_DIR: destination
-
-  filebeat-destination:
-    <<: *filebeat
-    profiles:
-      - destination-with-elk-logging
-    volumes:
-      - "${FILEBEAT_CONFIG_PATH:?}:/usr/share/filebeat/filebeat.yml:ro"
-      - "${FILEBEAT_LOGS_DIR:?}:/usr/share/filebeat/logs:ro"
-      - "${FILEBEAT_DATA_DIR:?}:/usr/share/filebeat/data"
-      - "${ELASTICSEARCH_CERT_PATH:?}:/usr/share/elasticsearch/config/certs/cert.crt:ro"
-      - "${DB_LOGS_DIR:?}:/logs/destination/postgresql:ro"
-      - "${PYTHON_LOGS_DIR:?}/backend-destination:/logs/destination/backend:ro"
-      - "${PYTHON_LOGS_DIR:?}/receiver:/logs/destination/receiver:ro"
-      - "${PYTHON_LOGS_DIR:?}/dbtrimmer-destination:/logs/destination/dbtrimmer:ro"
-      - "${PYTHON_LOGS_DIR:?}/file_remover:/logs/destination/file_remover:ro"
-      - "${PYTHON_LOGS_DIR:?}/db-migrations-destination:/logs/destination/db-migrations:ro"
 
   dbtrimmer-destination: &dbtrimmer-destination
     profiles:
@@ -457,14 +400,6 @@ services:
     command:
       - make
       - run-destination-dbtrimmer
-
-  dbtrimmer-destination-with-elk:
-    profiles:
-      - destination-with-elk-logging
-    <<: *dbtrimmer-destination
-    depends_on:
-      filebeat-destination:
-        condition: service_healthy
 
   file-remover: &file-remover
     profiles:
@@ -485,14 +420,6 @@ services:
       - make
       - run-destination-file-remover
 
-  file-remover-with-elk:
-    profiles:
-      - destination-with-elk-logging
-    <<: *file-remover
-    depends_on:
-      filebeat-destination:
-        condition: service_healthy
-
   ############# Destination tools #############
   db-migrations-destination: &db-migrations-destination
     profiles:
@@ -510,16 +437,6 @@ services:
       - migrate
     depends_on:
       db:
-        condition: service_healthy
-
-  db-migrations-destination-with-elk:
-    profiles:
-      - migration-destination-with-elk-logging
-    <<: *db-migrations-destination
-    depends_on:
-      db:
-        condition: service_healthy
-      filebeat-destination:
         condition: service_healthy
 
 networks:
