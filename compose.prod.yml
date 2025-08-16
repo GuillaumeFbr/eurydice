@@ -77,7 +77,7 @@ services:
       - "--entrypoints.web.address=:80"
       - "--api.dashboard=true"
     ports:
-      - "80:80"
+      - "1234:80"
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock:ro"
     labels:
@@ -286,7 +286,7 @@ services:
     networks:
       - eurydice
     ports:
-      - 9874:80
+      - 80:80
     volumes:
       - ./volumes/default.conf:/etc/nginx/conf.d/default.conf
 
